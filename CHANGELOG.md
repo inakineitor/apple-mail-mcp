@@ -1,5 +1,12 @@
 ## [Unreleased]
 
+## [2.10.12] - 2026-08-12
+
+### Added
+
+- **Opt-in Streamable HTTP transport for embedded and long-lived MCP hosts.** Start with `--transport streamable-http`, configure the loopback host, port, and endpoint through CLI flags or `APPLE_MAIL_MCP_HTTP_*` environment variables, and connect at `/mcp`. The default remains stdio, so existing host configurations are unchanged. HTTP mode creates an independent MCP server for each session and supports explicit session termination.
+- **A lightweight `/health` readiness endpoint for process supervisors.** Streamable HTTP binds to `127.0.0.1` by default, supports `X-API-Key` authentication, requires a key for non-loopback bindings, and rejects browser-origin requests. This keeps the transport suitable for native desktop applications without adding a web framework or proxy dependency.
+
 ## [2.10.11] - 2026-08-12
 
 ### Security

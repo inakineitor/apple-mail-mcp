@@ -1,6 +1,6 @@
 {
   "name": "apple-mail-mcp",
-  "version": "2.10.11",
+  "version": "2.10.12",
   "packageManager": "pnpm@11.9.0",
   "description": "MCP server for Apple Mail - read, search, send, and manage emails via Claude and other AI assistants",
   "type": "module",
@@ -34,7 +34,7 @@
     "sync:skills": "node scripts/sync-skills.mjs",
     "version": "node scripts/sync-plugin-version.mjs && git add .claude-plugin .agents/plugins codex .antigravity-plugin",
     "prepublishOnly": "pnpm run lint && pnpm test && pnpm run build",
-    "prepare": "husky; pnpm run build"
+    "prepare": "node scripts/prepare-package.mjs"
   },
   "keywords": [
     "mcp",
