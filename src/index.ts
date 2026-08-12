@@ -21,11 +21,7 @@
  */
 
 import { createRequire } from "module";
-import {
-  McpServer,
-  type RegisteredTool,
-  type ToolCallback,
-} from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -107,6 +103,7 @@ import { extractRfcMessageIdFromSource } from "@/utils/mimeParse.js";
 import { ImapIdleWatcher } from "@/services/imapIdle.js";
 import { loadFileConfig } from "@/services/fileConfig.js";
 import { isOrphaned } from "@/utils/orphan.js";
+import { resolveTransportConfig, startStreamableHttpServer } from "@/streamableHttp.js";
 
 // Load file-based config FIRST (2.1.1) — before anything reads APPLE_MAIL_MCP_*.
 // Lets users configure the server when the host app strips the MCP env block.
@@ -341,18 +338,8 @@ function mergedMessageResponse(
 // Server Initialization
 // =============================================================================
 
-/**
- * MCP server instance configured for Apple Mail operations.
- */
-const server = new McpServer(
-  {
-    name: "apple-mail",
-    version,
-    description: "MCP server for managing Apple Mail - read, search, send, and organize emails",
-  },
-  // logging capability lets the IMAP IDLE watcher push new-mail notifications (B5).
-  { capabilities: { logging: {} } }
-);
+type ToolRegistration = (server: McpServer) => void;
+const toolRegistrations: ToolRegistration[] = [];
 
 /**
  * Register a tool, advertising its `outputSchema` as PERMISSIVE.
@@ -386,13 +373,15 @@ function registerTool<
     annotations?: ToolAnnotations;
   },
   cb: ToolCallback<InputArgs>
-): RegisteredTool {
+): void {
   const { outputSchema, ...rest } = config;
-  return server.registerTool(
-    name,
-    outputSchema ? { ...rest, outputSchema: z.object(outputSchema).passthrough() } : rest,
-    cb
-  );
+  toolRegistrations.push((server) => {
+    server.registerTool(
+      name,
+      outputSchema ? { ...rest, outputSchema: z.object(outputSchema).passthrough() } : rest,
+      cb
+    );
+  });
 }
 
 /**
@@ -400,10 +389,6 @@ function registerTool<
  * Handles all AppleScript execution and mail operations.
  */
 const mailManager = new AppleMailManager();
-
-// MCP resources (accounts/templates/mailboxes) and prompts (triage/reply/
-// summary) — additive context + workflows alongside the tools (D2).
-registerResourcesAndPrompts(server, mailManager);
 
 // Response helpers, the AppleScript serial gate, withErrorHandling, and the
 // message backend router now live in @/tools/respond and @/services/messageRouter.
@@ -3210,8 +3195,24 @@ registerTool(
 // =============================================================================
 
 /**
- * Initialize and start the MCP server.
+ * Create an independently connectable MCP server. Tool handlers share the
+ * AppleMailManager so Mail.app operations remain serialized across sessions.
  */
+function createAppleMailServer(): McpServer {
+  const server = new McpServer(
+    {
+      name: "apple-mail",
+      version,
+      description: "MCP server for managing Apple Mail - read, search, send, and organize emails",
+    },
+    // Logging lets the IMAP IDLE watcher push new-mail notifications (B5).
+    { capabilities: { logging: {} } }
+  );
+  for (const register of toolRegistrations) register(server);
+  registerResourcesAndPrompts(server, mailManager);
+  return server;
+}
+
 // Defense-in-depth: a stray EventEmitter "error" (e.g. an idle IMAP/SMTP socket
 // drop) or an unhandled rejection must never take down this long-lived MCP
 // server. EPIPE on stdout means the MCP client went away — exit cleanly.
@@ -3223,8 +3224,28 @@ process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection]", reason);
 });
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+const transportConfig = resolveTransportConfig();
+const activeServers = new Set<McpServer>();
+let closeTransport: () => Promise<void>;
+
+if (transportConfig.kind === "stdio") {
+  const server = createAppleMailServer();
+  activeServers.add(server);
+  await server.connect(new StdioServerTransport());
+  closeTransport = async () => {
+    activeServers.delete(server);
+    await server.close();
+  };
+} else {
+  const httpServer = await startStreamableHttpServer({
+    ...transportConfig,
+    createServer: createAppleMailServer,
+    onServerClosed: (server) => activeServers.delete(server),
+    onServerCreated: (server) => activeServers.add(server),
+  });
+  console.error(`Apple Mail MCP listening on ${httpServer.url.href}`);
+  closeTransport = httpServer.close;
+}
 
 // IMAP IDLE push notifications (B5) — opt-in. When enabled, watch every
 // configured IMAP account's INBOX and notify the client on new mail via a
@@ -3238,16 +3259,18 @@ if (/^(1|true|yes|on)$/i.test(process.env.APPLE_MAIL_MCP_IMAP_IDLE?.trim() ?? ""
         configs,
         onNewMail: (e) => {
           const newCount = e.count - e.prevCount;
-          void server.server
-            .sendLoggingMessage({
-              level: "info",
-              logger: "apple-mail-mcp",
-              data: `New mail in "${e.account}": ${newCount} new message(s) (INBOX now ${e.count}).`,
-            })
-            .catch(() => undefined);
-          void server.server
-            .sendResourceUpdated({ uri: `mail://mailboxes/${encodeURIComponent(e.account)}` })
-            .catch(() => undefined);
+          for (const server of activeServers) {
+            void server.server
+              .sendLoggingMessage({
+                level: "info",
+                logger: "apple-mail-mcp",
+                data: `New mail in "${e.account}": ${newCount} new message(s) (INBOX now ${e.count}).`,
+              })
+              .catch(() => undefined);
+            void server.server
+              .sendResourceUpdated({ uri: `mail://mailboxes/${encodeURIComponent(e.account)}` })
+              .catch(() => undefined);
+          }
         },
       });
       await idleWatcher.start();
@@ -3276,15 +3299,19 @@ const shutdown = (): void => {
   // (one persistent socket per account when APPLE_MAIL_MCP_IMAP_IDLE=1) and
   // dropAllPools() closes the request pool — together this releases EVERY IMAP
   // socket this instance holds, which is the whole point of the orphan check.
-  void Promise.allSettled([idleWatcher?.stop() ?? Promise.resolve(), dropAllPools()]).finally(() =>
-    process.exit(0)
-  );
+  void Promise.allSettled([
+    closeTransport(),
+    idleWatcher?.stop() ?? Promise.resolve(),
+    dropAllPools(),
+  ]).finally(() => process.exit(0));
 };
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, shutdown);
 }
-process.stdin.on("end", shutdown);
-process.stdin.on("close", shutdown);
+if (transportConfig.kind === "stdio") {
+  process.stdin.on("end", shutdown);
+  process.stdin.on("close", shutdown);
+}
 
 // Parent-death watchdog (connection-footprint hardening, v2.6.1). The exit
 // paths above all rely on a signal or stdin-EOF, but a host (claude-code) that

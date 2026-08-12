@@ -124,6 +124,34 @@ npm install -g apple-mail-mcp
 
 On first use, macOS will ask for permission to automate Mail.app. Click "OK" to allow.
 
+### Streamable HTTP
+
+The default transport remains stdio. Hosts that need an HTTP MCP endpoint can
+opt into Streamable HTTP:
+
+```bash
+APPLE_MAIL_MCP_HTTP_API_KEY="$(openssl rand -hex 32)" \
+  apple-mail-mcp --transport streamable-http --host 127.0.0.1 --port 3000
+```
+
+The MCP endpoint is `http://127.0.0.1:3000/mcp`, and the readiness endpoint is
+`http://127.0.0.1:3000/health`. Clients authenticate with the `X-API-Key`
+header. The server rejects requests carrying an `Origin` header because this
+mode is intended for native, server-side, and local agent clients rather than
+browser pages.
+
+| CLI option | Environment variable | Default |
+|------------|----------------------|---------|
+| `--transport` | `APPLE_MAIL_MCP_TRANSPORT` | `stdio` |
+| `--host` | `APPLE_MAIL_MCP_HTTP_HOST` | `127.0.0.1` |
+| `--port` | `APPLE_MAIL_MCP_HTTP_PORT` | `3000` |
+| `--endpoint` | `APPLE_MAIL_MCP_HTTP_ENDPOINT` | `/mcp` |
+| — | `APPLE_MAIL_MCP_HTTP_API_KEY` | No key on loopback |
+
+An API key is required when binding outside loopback and recommended for every
+long-lived local server. Port `0` asks the operating system to allocate an
+available port. The selected URL is written to stderr after startup.
+
 ## Configuring email (IMAP & SMTP)
 
 The server works out of the box over AppleScript with **no configuration**. Two
